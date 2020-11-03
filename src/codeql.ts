@@ -74,7 +74,7 @@ export interface CodeQL {
   /**
    * Finalize a database using 'codeql database finalize'.
    */
-  finalizeDatabase(databasePath: string): Promise<void>;
+  finalizeDatabase(databasePath: string, threadsFlag: string): Promise<void>;
   /**
    * Run 'codeql resolve queries'.
    */
@@ -564,12 +564,13 @@ function getCodeQLForCmd(cmd: string): CodeQL {
         errorMatchers
       );
     },
-    async finalizeDatabase(databasePath: string) {
+    async finalizeDatabase(databasePath: string, threadsFlag: string) {
       await toolrunnerErrorCatcher(
         cmd,
         [
           "database",
           "finalize",
+          threadsFlag,
           ...getExtraOptionsFromEnv(["database", "finalize"]),
           databasePath,
         ],
