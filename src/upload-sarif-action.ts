@@ -4,6 +4,7 @@ import * as actionsUtil from "./actions-util";
 import { getActionsLogger } from "./logging";
 import { parseRepositoryNwo } from "./repository";
 import * as upload_lib from "./upload-lib";
+import { getGHESVersion } from "./util";
 
 interface UploadSarifStatusReport
   extends actionsUtil.StatusReportBase,
@@ -45,7 +46,9 @@ async function run() {
       url: actionsUtil.getRequiredEnvParam("GITHUB_SERVER_URL"),
     };
 
-    const uploadStats = await upload_lib.uploadFromActions(
+    const ghesVersion = await getGHESVersion(apiDetails);
+
+    const uploadStats = await upload_lib.upload(
       actionsUtil.getRequiredInput("sarif_file"),
       parseRepositoryNwo(actionsUtil.getRequiredEnvParam("GITHUB_REPOSITORY")),
       await actionsUtil.getCommitOid(),
@@ -55,7 +58,9 @@ async function run() {
       actionsUtil.getWorkflowRunID(),
       actionsUtil.getRequiredInput("checkout_path"),
       actionsUtil.getRequiredInput("matrix"),
+      ghesVersion,
       apiDetails,
+      "actions",
       getActionsLogger()
     );
     await sendSuccessStatusReport(startedAt, uploadStats);
