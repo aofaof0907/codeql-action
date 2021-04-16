@@ -7,6 +7,7 @@ import * as analysisPaths from "./analysis-paths";
 import { GitHubApiDetails } from "./api-client";
 import { getCodeQL } from "./codeql";
 import * as configUtils from "./config-utils";
+import { countLoc } from "./count-loc";
 import { isScannedLanguage, Language } from "./languages";
 import { Logger } from "./logging";
 import { RepositoryNwo } from "./repository";
@@ -146,6 +147,18 @@ export async function runQueries(
 ): Promise<QueriesStatusReport> {
   const statusReport: QueriesStatusReport = {};
 
+  // count the number of lines in the background
+  const locPromise = countLoc(
+    path.resolve(),
+    // config.paths specifies external directories. the current
+    // directory is included in the analysis by default. Replicate
+    // that here.
+    ["**"].concat(config.paths || []),
+    config.pathsIgnore,
+    config.languages,
+    logger
+  );
+
   for (const language of config.languages) {
     logger.startGroup(`Analyzing ${language}`);
 
@@ -159,13 +172,15 @@ export async function runQueries(
     try {
       if (queries["builtin"].length > 0) {
         const startTimeBuliltIn = new Date().getTime();
-        await runQueryGroup(
+        const sarifFile = await runQueryGroup(
           language,
           "builtin",
           queries["builtin"],
           sarifFolder,
           undefined
         );
+        await injectLinesOfCode(sarifFile, language, locPromise);
+
         statusReport[`analyze_builtin_queries_${language}_duration_ms`] =
           new Date().getTime() - startTimeBuliltIn;
       }
@@ -174,23 +189,21 @@ export async function runQueries(
       const temporarySarifFiles: string[] = [];
       for (let i = 0; i < queries["custom"].length; ++i) {
         if (queries["custom"][i].queries.length > 0) {
-          await runQueryGroup(
+          const sarifFile = await runQueryGroup(
             language,
             `custom-${i}`,
             queries["custom"][i].queries,
             temporarySarifDir,
             queries["custom"][i].searchPath
           );
-          temporarySarifFiles.push(
-            path.join(temporarySarifDir, `${language}-custom-${i}.sarif`)
-          );
+          temporarySarifFiles.push(sarifFile);
         }
       }
       if (temporarySarifFiles.length > 0) {
-        fs.writeFileSync(
-          path.join(sarifFolder, `${language}-custom.sarif`),
-          combineSarifFiles(temporarySarifFiles)
-        );
+        const sarifFile = path.join(sarifFolder, `${language}-custom.sarif`);
+        fs.writeFileSync(sarifFile, combineSarifFiles(temporarySarifFiles));
+        await injectLinesOfCode(sarifFile, language, locPromise);
+
         statusReport[`analyze_custom_queries_${language}_duration_ms`] =
           new Date().getTime() - startTimeCustom;
       }
@@ -212,7 +225,7 @@ export async function runQueries(
     queries: string[],
     destinationFolder: string,
     searchPath: string | undefined
-  ): Promise<void> {
+  ): Promise<string> {
     const databasePath = util.getCodeQLDatabasePath(config.tempDir, language);
     // Pass the queries to codeql using a file instead of using the command
     // line to avoid command line length restrictions, particularly on windows.
@@ -240,6 +253,8 @@ export async function runQueries(
       `SARIF results for database ${language} created at "${sarifFile}"`
     );
     logger.endGroup();
+
+    return sarifFile;
   }
 }
 
@@ -302,4 +317,31 @@ export async function runAnalyze(
   );
 
   return { ...queriesStats, ...uploadStats };
+}
+
+async function injectLinesOfCode(
+  sarifFile: string,
+  language: string,
+  locPromise: Promise<Record<string, number>>
+) {
+  const lineCounts = await locPromise;
+  if (language in lineCounts) {
+    const sarif = JSON.parse(fs.readFileSync(sarifFile, "utf8"));
+    if (Array.isArray(sarif.runs)) {
+      for (const run of sarif.runs) {
+        const metricId = `${language}/summary/lines-of-code`;
+        run.properties = run.properties || {};
+        run.properties.metricResults = run.properties.metricResults || [];
+        const metric = run.properties.metricResults.find(
+          // the metric id can be in either of two places
+          (m) => m.metricId === metricId || m.metric?.id === metricId
+        );
+        // only add the baseline value if the metric already exists
+        if (metric) {
+          metric.baseline = lineCounts[language];
+        }
+      }
+    }
+    fs.writeFileSync(sarifFile, JSON.stringify(sarif));
+  }
 }
