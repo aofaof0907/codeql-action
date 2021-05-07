@@ -7,7 +7,7 @@ import * as analysisPaths from "./analysis-paths";
 import { GitHubApiDetails } from "./api-client";
 import { getCodeQL } from "./codeql";
 import * as configUtils from "./config-utils";
-import { countLoc } from "./count-loc";
+import { IdPrefixes, countLoc } from "./count-loc";
 import { isScannedLanguage, Language } from "./languages";
 import { Logger } from "./logging";
 import { RepositoryNwo } from "./repository";
@@ -326,7 +326,7 @@ export async function runAnalyze(
 async function injectLinesOfCode(
   sarifFile: string,
   language: string,
-  locPromise: Promise<Record<string, number>>
+  locPromise: Promise<Partial<Record<IdPrefixes, number>>>
 ) {
   const lineCounts = await locPromise;
   if (language in lineCounts) {
