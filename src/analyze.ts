@@ -171,15 +171,17 @@ export async function runQueries(
     }
 
     try {
+      let analysisSummary = "";
       if (queries["builtin"].length > 0) {
         const startTimeBuliltIn = new Date().getTime();
-        const sarifFile = await runQueryGroup(
+        const { sarifFile, stdout } = await runQueryGroup(
           language,
           "builtin",
           queries["builtin"],
           sarifFolder,
           undefined
         );
+        analysisSummary = stdout;
         await injectLinesOfCode(sarifFile, language, locPromise);
 
         statusReport[`analyze_builtin_queries_${language}_duration_ms`] =
@@ -190,7 +192,7 @@ export async function runQueries(
       const temporarySarifFiles: string[] = [];
       for (let i = 0; i < queries["custom"].length; ++i) {
         if (queries["custom"][i].queries.length > 0) {
-          const sarifFile = await runQueryGroup(
+          const { sarifFile } = await runQueryGroup(
             language,
             `custom-${i}`,
             queries["custom"][i].queries,
@@ -208,8 +210,13 @@ export async function runQueries(
         statusReport[`analyze_custom_queries_${language}_duration_ms`] =
           new Date().getTime() - startTimeCustom;
       }
+      logger.endGroup();
 
+      // Print the LoC baseline and the summary results from database analyze.
+      logger.startGroup(`Analysis summary for ${language}`);
       printLinesOfCodeSummary(logger, language, await locPromise);
+      logger.info(analysisSummary);
+      logger.endGroup();
     } catch (e) {
       logger.info(e);
       statusReport.analyze_failure_language = language;
@@ -228,7 +235,7 @@ export async function runQueries(
     queries: string[],
     destinationFolder: string,
     searchPath: string | undefined
-  ): Promise<string> {
+  ): Promise<{ sarifFile: string; stdout: string }> {
     const databasePath = util.getCodeQLDatabasePath(config, language);
     // Pass the queries to codeql using a file instead of using the command
     // line to avoid command line length restrictions, particularly on windows.
@@ -242,7 +249,7 @@ export async function runQueries(
     const sarifFile = path.join(destinationFolder, `${language}-${type}.sarif`);
 
     const codeql = getCodeQL(config.codeQLCmd);
-    await codeql.databaseAnalyze(
+    const databaseAnalyzeStdout = await codeql.databaseAnalyze(
       databasePath,
       sarifFile,
       searchPath,
@@ -256,9 +263,7 @@ export async function runQueries(
     logger.debug(
       `SARIF results for database ${language} created at "${sarifFile}"`
     );
-    logger.endGroup();
-
-    return sarifFile;
+    return { sarifFile, stdout: databaseAnalyzeStdout };
   }
 }
 
