@@ -2,8 +2,6 @@ import * as fs from "fs";
 import * as path from "path";
 
 import test from "ava";
-import * as yaml from "js-yaml";
-import { clean } from "semver";
 import sinon from "sinon";
 
 import { runQueries } from "./analyze";
@@ -35,28 +33,19 @@ test("status report fields and search path setting", async (t) => {
     const memoryFlag = "";
     const addSnippetsFlag = "";
     const threadsFlag = "";
-    const packs = {
-      [Language.cpp]: [
-        {
-          packName: "a/b",
-          version: clean("1.0.0")!,
-        },
-      ],
-      [Language.java]: [
-        {
-          packName: "c/d",
-          version: clean("2.0.0")!,
-        },
-      ],
-    };
 
     for (const language of Object.values(Language)) {
       setCodeQL({
-        packDownload: async () => ({ packs: [] }),
-        databaseAnalyze: async (
-          _,
-          sarifFile: string,
+        databaseRunQueries: async (
+          _db: string,
           searchPath: string | undefined
+        ) => {
+          searchPathsUsed.push(searchPath);
+        },
+        databaseInterpretResults: async (
+          _db: string,
+          _queriesRun: string[],
+          sarifFile: string
         ) => {
           fs.writeFileSync(
             sarifFile,
@@ -92,7 +81,6 @@ test("status report fields and search path setting", async (t) => {
               ],
             })
           );
-          searchPathsUsed.push(searchPath);
           return "";
         },
       });
@@ -111,7 +99,6 @@ test("status report fields and search path setting", async (t) => {
           type: util.GitHubVariant.DOTCOM,
         } as util.GitHubVersion,
         dbLocation: path.resolve(tmpDir, "codeql_databases"),
-        packs,
       };
       fs.mkdirSync(util.getCodeQLDatabasePath(config, language), {
         recursive: true,
@@ -130,10 +117,12 @@ test("status report fields and search path setting", async (t) => {
         config,
         getRunnerLogger(true)
       );
-      const hasPacks = language in packs;
-      t.deepEqual(Object.keys(builtinStatusReport).length, hasPacks ? 2 : 1);
+      t.deepEqual(Object.keys(builtinStatusReport).length, 2);
       t.true(
         `analyze_builtin_queries_${language}_duration_ms` in builtinStatusReport
+      );
+      t.true(
+        `interpret_results_${language}_duration_ms` in builtinStatusReport
       );
 
       config.queries[language] = {
@@ -158,18 +147,15 @@ test("status report fields and search path setting", async (t) => {
         config,
         getRunnerLogger(true)
       );
-      t.deepEqual(Object.keys(customStatusReport).length, 1);
+      t.deepEqual(Object.keys(customStatusReport).length, 2);
       t.true(
         `analyze_custom_queries_${language}_duration_ms` in customStatusReport
       );
-      const expectedSearchPathsUsed = hasPacks
-        ? [undefined, undefined, "/1", "/2", undefined]
-        : [undefined, "/1", "/2"];
-      t.deepEqual(searchPathsUsed, expectedSearchPathsUsed);
+      t.true(`interpret_results_${language}_duration_ms` in customStatusReport);
+      t.deepEqual(searchPathsUsed, [undefined, "/1", "/2"]);
     }
 
     verifyLineCounts(tmpDir);
-    verifyQuerySuites(tmpDir);
   });
 
   function verifyLineCounts(tmpDir: string) {
@@ -177,12 +163,7 @@ test("status report fields and search path setting", async (t) => {
     Object.keys(Language).forEach((lang, i) => {
       verifyLineCountForFile(
         lang as Language,
-        path.join(tmpDir, `${lang}-builtin.sarif`),
-        i + 1
-      );
-      verifyLineCountForFile(
-        lang as Language,
-        path.join(tmpDir, `${lang}-custom.sarif`),
+        path.join(tmpDir, `${lang}.sarif`),
         i + 1
       );
     });
@@ -211,59 +192,7 @@ test("status report fields and search path setting", async (t) => {
         baseline: lineCount,
       },
     ]);
-    // when the rule doesn't exist, it should not be added
+    // when the rule doesn't exists, it should not be added
     t.deepEqual(sarif.runs[2].properties.metricResults, []);
-  }
-
-  function verifyQuerySuites(tmpDir: string) {
-    const qlsContent = [
-      {
-        query: "foo.ql",
-      },
-    ];
-    const qlsContent2 = [
-      {
-        query: "bar.ql",
-      },
-    ];
-    const qlsPackContentCpp = [
-      {
-        qlpack: "a/b",
-        version: "1.0.0",
-      },
-    ];
-    const qlsPackContentJava = [
-      {
-        qlpack: "c/d",
-        version: "2.0.0",
-      },
-    ];
-    for (const lang of Object.values(Language)) {
-      t.deepEqual(readContents(`${lang}-queries-builtin.qls`), qlsContent);
-      t.deepEqual(readContents(`${lang}-queries-custom-0.qls`), qlsContent);
-      t.deepEqual(readContents(`${lang}-queries-custom-1.qls`), qlsContent2);
-      const packSuiteName = `${lang}-queries-packs.qls`;
-      if (lang === Language.cpp) {
-        t.deepEqual(readContents(packSuiteName), qlsPackContentCpp);
-      } else if (lang === Language.java) {
-        t.deepEqual(readContents(packSuiteName), qlsPackContentJava);
-      } else {
-        t.false(
-          fs.existsSync(path.join(tmpDir, "codeql_databases", packSuiteName))
-        );
-      }
-    }
-
-    function readContents(name: string) {
-      const x = fs.readFileSync(
-        path.join(tmpDir, "codeql_databases", name),
-        "utf8"
-      );
-      console.log(x);
-
-      return yaml.safeLoad(
-        fs.readFileSync(path.join(tmpDir, "codeql_databases", name), "utf8")
-      );
-    }
   }
 });

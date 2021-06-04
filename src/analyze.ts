@@ -4,15 +4,12 @@ import * as path from "path";
 import * as toolrunner from "@actions/exec/lib/toolrunner";
 
 import * as analysisPaths from "./analysis-paths";
-import { GitHubApiDetails } from "./api-client";
 import { getCodeQL } from "./codeql";
 import * as configUtils from "./config-utils";
 import { countLoc, getIdPrefix } from "./count-loc";
 import { isScannedLanguage, Language } from "./languages";
 import { Logger } from "./logging";
-import { RepositoryNwo } from "./repository";
 import * as sharedEnv from "./shared-environment";
-import { combineSarifFiles } from "./upload-lib";
 import * as util from "./util";
 
 export class CodeQLAnalysisError extends Error {
@@ -165,110 +162,69 @@ export async function runQueries(
   );
 
   for (const language of config.languages) {
-    logger.startGroup(`Analyzing ${language}`);
+    logger.startGroup(`Running queries for ${language}`);
 
     const queries = config.queries[language];
-    const packsWithVersion = config.packs[language] || [];
-
-    const hasBuiltinQueries = queries?.builtin.length > 0;
-    const hasCustomQueries = queries?.custom.length > 0;
-    const hasPackWithCustomQueries = packsWithVersion.length > 0;
-    if (!hasBuiltinQueries && !hasCustomQueries && !hasPackWithCustomQueries) {
+    if (
+      queries === undefined ||
+      (queries.builtin.length === 0 && queries.custom.length === 0)
+    ) {
       throw new Error(
         `Unable to analyse ${language} as no queries were selected for this language`
       );
     }
 
     try {
-      if (hasPackWithCustomQueries) {
-        const codeql = getCodeQL(config.codeQLCmd);
-        const results = await codeql.packDownload(packsWithVersion);
-        logger.info(
-          `Downloaded packs: ${results.packs
-            .map((r) => `${r.name}@${r.version || "latest"}`)
-            .join(", ")}`
-        );
-      }
-
-      let analysisSummaryBuiltIn = "";
-      const customAnalysisSummaries: string[] = [];
+      const querySuitePaths: string[] = [];
       if (queries["builtin"].length > 0) {
         const startTimeBuiltIn = new Date().getTime();
-        const { sarifFile, stdout } = await runQueryGroup(
-          language,
-          "builtin",
-          createQuerySuiteContents(queries["builtin"]),
-          sarifFolder,
-          undefined
+        querySuitePaths.push(
+          await runQueryGroup(
+            language,
+            "builtin",
+            queries["builtin"],
+            undefined
+          )
         );
-        analysisSummaryBuiltIn = stdout;
-        await injectLinesOfCode(sarifFile, language, locPromise);
-
         statusReport[`analyze_builtin_queries_${language}_duration_ms`] =
           new Date().getTime() - startTimeBuiltIn;
       }
       const startTimeCustom = new Date().getTime();
-      const temporarySarifDir = config.tempDir;
-      const temporarySarifFiles: string[] = [];
+      let ranCustom = false;
       for (let i = 0; i < queries["custom"].length; ++i) {
         if (queries["custom"][i].queries.length > 0) {
-          const { sarifFile, stdout } = await runQueryGroup(
-            language,
-            `custom-${i}`,
-            createQuerySuiteContents(queries["custom"][i].queries),
-            temporarySarifDir,
-            queries["custom"][i].searchPath
+          querySuitePaths.push(
+            await runQueryGroup(
+              language,
+              `custom-${i}`,
+              queries["custom"][i].queries,
+              queries["custom"][i].searchPath
+            )
           );
-          customAnalysisSummaries.push(stdout);
-          temporarySarifFiles.push(sarifFile);
+          ranCustom = true;
         }
       }
-      if (packsWithVersion.length > 0) {
-        const { sarifFile, stdout } = await runQueryGroup(
-          language,
-          "packs",
-          createPackSuiteContents(packsWithVersion),
-          temporarySarifDir,
-          undefined
-        );
-        customAnalysisSummaries.push(stdout);
-        temporarySarifFiles.push(sarifFile);
-      }
-      if (temporarySarifFiles.length > 0) {
-        const sarifFile = path.join(sarifFolder, `${language}-custom.sarif`);
-        fs.writeFileSync(sarifFile, combineSarifFiles(temporarySarifFiles));
-        await injectLinesOfCode(sarifFile, language, locPromise);
-
+      if (ranCustom) {
         statusReport[`analyze_custom_queries_${language}_duration_ms`] =
           new Date().getTime() - startTimeCustom;
       }
       logger.endGroup();
-
-      // Print the LoC baseline and the summary results from database analyze for the standard
-      // query suite and (if appropriate) each custom query suite.
-      logger.startGroup(`Analysis summary for ${language}`);
-
-      printLinesOfCodeSummary(logger, language, await locPromise);
-      logger.info(analysisSummaryBuiltIn);
-
-      for (const [i, customSummary] of customAnalysisSummaries.entries()) {
-        if (customSummary.trim() === "") {
-          continue;
-        }
-        const description =
-          customAnalysisSummaries.length === 1
-            ? "custom queries"
-            : `custom query suite ${i + 1}/${customAnalysisSummaries.length}`;
-        logger.info(`Analysis summary for ${description}:`);
-        logger.info("");
-        logger.info(customSummary);
-        logger.info("");
-      }
-
+      logger.startGroup(`Interpreting results for ${language}`);
+      const startTimeInterpretResults = new Date().getTime();
+      const sarifFile = path.join(sarifFolder, `${language}.sarif`);
+      const analysisSummary = await runInterpretResults(
+        language,
+        querySuitePaths,
+        sarifFile
+      );
+      await injectLinesOfCode(sarifFile, language, locPromise);
+      statusReport[`interpret_results_${language}_duration_ms`] =
+        new Date().getTime() - startTimeInterpretResults;
       logger.endGroup();
+      logger.info(analysisSummary);
+      printLinesOfCodeSummary(logger, language, await locPromise);
     } catch (e) {
       logger.info(e);
-      logger.info(e.stack);
       statusReport.analyze_failure_language = language;
       throw new CodeQLAnalysisError(
         statusReport,
@@ -279,75 +235,54 @@ export async function runQueries(
 
   return statusReport;
 
-  async function runQueryGroup(
+  async function runInterpretResults(
     language: Language,
-    type: string,
-    querySuiteContents: string,
-    destinationFolder: string,
-    searchPath: string | undefined
-  ): Promise<{ sarifFile: string; stdout: string }> {
+    queries: string[],
+    sarifFile: string
+  ): Promise<string> {
     const databasePath = util.getCodeQLDatabasePath(config, language);
-    // Pass the queries to codeql using a file instead of using the command
-    // line to avoid command line length restrictions, particularly on windows.
-    const querySuitePath = `${databasePath}-queries-${type}.qls`;
-    fs.writeFileSync(querySuitePath, querySuiteContents);
-    logger.debug(
-      `Query suite file for ${language}-${type}...\n${querySuiteContents}`
-    );
-
-    const sarifFile = path.join(destinationFolder, `${language}-${type}.sarif`);
-
     const codeql = getCodeQL(config.codeQLCmd);
-    const databaseAnalyzeStdout = await codeql.databaseAnalyze(
+    return await codeql.databaseInterpretResults(
       databasePath,
+      queries,
       sarifFile,
-      searchPath,
-      querySuitePath,
-      memoryFlag,
       addSnippetsFlag,
       threadsFlag,
       automationDetailsId
     );
+  }
 
-    logger.debug(
-      `SARIF results for database ${language} created at "${sarifFile}"`
+  async function runQueryGroup(
+    language: Language,
+    type: string,
+    queries: string[],
+    searchPath: string | undefined
+  ): Promise<string> {
+    const databasePath = util.getCodeQLDatabasePath(config, language);
+    // Pass the queries to codeql using a file instead of using the command
+    // line to avoid command line length restrictions, particularly on windows.
+    const querySuitePath = `${databasePath}-queries-${type}.qls`;
+    const querySuiteContents = queries
+      .map((q: string) => `- query: ${q}`)
+      .join("\n");
+    fs.writeFileSync(querySuitePath, querySuiteContents);
+    logger.debug(`Query suite file for ${language}...\n${querySuiteContents}`);
+
+    const codeql = getCodeQL(config.codeQLCmd);
+    await codeql.databaseRunQueries(
+      databasePath,
+      searchPath,
+      querySuitePath,
+      memoryFlag,
+      threadsFlag
     );
-    return { sarifFile, stdout: databaseAnalyzeStdout };
+
+    logger.debug(`BQRS results produced for ${language} (queries: ${type})"`);
+    return querySuitePath;
   }
-}
-
-function createQuerySuiteContents(queries: string[]) {
-  return queries.map((q: string) => `- query: ${q}`).join("\n");
-}
-
-function createPackSuiteContents(
-  packsWithVersion: configUtils.PackWithVersion[]
-) {
-  return packsWithVersion.map(packWithVersionToQuerySuiteEntry).join("\n");
-}
-
-function packWithVersionToQuerySuiteEntry(
-  pack: configUtils.PackWithVersion
-): string {
-  let text = `- qlpack: ${pack.packName}`;
-  if (pack.version) {
-    text += `${"\n"}  version: ${pack.version}`;
-  }
-  return text;
 }
 
 export async function runAnalyze(
-  repositoryNwo: RepositoryNwo,
-  commitOid: string,
-  ref: string,
-  analysisKey: string | undefined,
-  analysisName: string | undefined,
-  workflowRunID: number | undefined,
-  checkoutPath: string,
-  environment: string | undefined,
-  apiDetails: GitHubApiDetails,
-  doUpload: boolean,
-  mode: util.Mode,
   outputDir: string,
   memoryFlag: string,
   addSnippetsFlag: string,
@@ -355,7 +290,7 @@ export async function runAnalyze(
   automationDetailsId: string | undefined,
   config: configUtils.Config,
   logger: Logger
-): Promise<AnalysisStatusReport> {
+): Promise<QueriesStatusReport> {
   // Delete the tracer config env var to avoid tracing ourselves
   delete process.env[sharedEnv.ODASA_TRACER_CONFIGURATION];
 
@@ -375,28 +310,7 @@ export async function runAnalyze(
     logger
   );
 
-  if (!doUpload) {
-    logger.info("Not uploading results");
-    return { ...queriesStats };
-  }
-
-  const uploadStats = await upload_lib.upload(
-    outputDir,
-    repositoryNwo,
-    commitOid,
-    ref,
-    analysisKey,
-    analysisName,
-    workflowRunID,
-    checkoutPath,
-    environment,
-    config.gitHubVersion,
-    apiDetails,
-    mode,
-    logger
-  );
-
-  return { ...queriesStats, ...uploadStats };
+  return { ...queriesStats };
 }
 
 export async function runCleanup(
