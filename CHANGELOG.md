@@ -1,6 +1,6 @@
 # CodeQL Action and CodeQL Runner Changelog
 
-## [UNRELEASED]
+## 1.0.6 - 19 Jul 2021
 
 No user facing changes.
 - The `init` step of the Action now supports a `source-root` input as a path to the root source-code directory. By default, the path is relative to $GITHUB_WORKSPACE. [#607](https://github.com/github/codeql-action/pull/607)
