@@ -4,6 +4,8 @@ This action runs GitHub's industry-leading semantic code analysis engine, CodeQL
 
 For a list of recent changes, see the CodeQL Action's [changelog](CHANGELOG.md).
 
+For a list of recent changes, see the CodeQL Action's [changelog](CHANGELOG.md).
+
 ## License
 
 This project is released under the [MIT License](LICENSE).
